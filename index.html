@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Трекер Тренировок</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            his: '#3b82f6',
+            her: '#ec4899',
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- React & ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body {
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .hide-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .hide-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+  </style>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen pb-20 font-sans antialiased selection:bg-indigo-500 selection:text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // --- ИНИЦИАЛИЗАЦИЯ И РАБОТА С INDEXEDDB ---
+    const DB_NAME = 'WorkoutTrackerDB';
+    const DB_VERSION = 1;
+
+    const initDB = () => {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+        request.onupgradeneeded = (e) => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains('workouts')) {
+            db.createObjectStore('workouts', { keyPath: 'id' });
+          }
+          if (!db.objectStoreNames.contains('muscleNotes')) {
+            db.createObjectStore('muscleNotes', { keyPath: 'id' });
+          }
+          if (!db.objectStoreNames.contains('userNotes')) {
+            db.createObjectStore('userNotes', { keyPath: 'id' });
+          }
+        };
+      });
+    };
+
+    const dbAPI = {
+      async getAll(storeName) {
+        const db = await initDB();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(storeName, 'readonly');
+          const store = tx.objectStore(storeName);
+          const req = store.getAll();
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      },
+      async save(storeName, item) {
+        const db = await initDB();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(storeName, 'readwrite');
+          const store = tx.objectStore(storeName);
+          const req = store.put(item);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      },
+      async delete(storeName, id) {
+        const db = await initDB();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(storeName, 'readwrite');
+          const store = tx.objectStore(storeName);
+          const req = store.delete(id);
+          req.onsuccess = () => resolve();
+          req.onerror = () => reject(req.error);
+        });
+      },
+      async clearAndImport(data) {
+        const db = await initDB();
+        const stores = ['workouts', 'muscleNotes', 'userNotes'];
+        for (const storeName of stores) {
+          const tx = db.transaction(storeName, 'readwrite');
+          tx.objectStore(storeName).clear();
+        }
+        if (data.workouts) {
+          for (const item of data.workouts) await this.save('workouts', item);
+        }
+        if (data.muscleNotes) {
+          for (const item of data.muscleNotes) await this.save('muscleNotes', item);
+        }
+        if (data.userNotes) {
+          for (const item of data.userNotes) await this.save('userNotes', item);
+        }
+      }
+    };
+
+    const MUSCLE_GROUPS = [
+      { id: 'legs', name: 'Ноги', icon: 'zap' },
+      { id: 'shoulders', name: 'Плечи', icon: 'shield' },
+      { id: 'back', name: 'Спина', icon: 'activity' },
+      { id: 'triceps', name: 'Трицепс', icon: 'flame' },
+      { id: 'biceps', name: 'Бицепс', icon: 'arm-flex' },
+      { id: 'chest', name: 'Грудь', icon: 'heart' }
+    ];
+
+    // Иконки SVG компонентов
+    const Icon = ({ name, className = "w-5 h-5" }) => {
+      useEffect(() => {
+        if (window.lucide) window.lucide.createIcons();
+      }, [name]);
+      return <i data-lucide={name} class={className}></i>;
+    };
+
+    function App() {
+      const [activeTab, setActiveTab] = useState('calendar');
+      const [workouts, setWorkouts] = useState([]);
+      const [muscleNotes, setMuscleNotes] = useState([]);
+      const [userNotes, setUserNotes] = useState([]);
+      
+      const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
+      const [currentMonth, setCurrentMonth] = useState(new Date());
+
+      // Модальные окна
+      const [isModalOpen, setIsModalOpen] = useState(false);
+      const [editingWorkout, setEditingWorkout] = useState(null);
+
+      // Форма тренировки
+      const [formData, setFormData] = useState({
+        user: 'his', // 'his' или 'her'
+        date: new Date().toISOString().split('T')[0],
+        title: '',
+        muscles: [],
+        duration: 60,
+        completed: true,
+        status: 'completed', // completed, planned, skipped
+        notes: ''
+      });
+
+      useEffect(() => {
+        loadData();
+      }, []);
+
+      const loadData = async () => {
+        try {
+          const w = await dbAPI.getAll('workouts');
+          const m = await dbAPI.getAll('muscleNotes');
+          const u = await dbAPI.getAll('userNotes');
+          setWorkouts(w || []);
+          setMuscleNotes(m || []);
+          setUserNotes(u || []);
+        } catch (err) {
+          console.error("Ошибка загрузки данных из DB:", err);
+        }
+      };
+
+      const handleSaveWorkout = async (e) => {
+        e.preventDefault();
+        const workoutToSave = {
+          ...formData,
+          id: editingWorkout ? editingWorkout.id : Date.now().toString(),
+          createdAt: editingWorkout ? editingWorkout.createdAt : new Date().toISOString()
+        };
+        await dbAPI.save('workouts', workoutToSave);
+        setIsModalOpen(false);
+        setEditingWorkout(null);
+        loadData();
+      };
+
+      const handleDeleteWorkout = async (id) => {
+        if (confirm("Удалить эту тренировку?")) {
+          await dbAPI.delete('workouts', id);
+          loadData();
+        }
+      };
+
+      const handleDuplicateWorkout = (w) => {
+        setFormData({
+          user: w.user,
+          date: new Date().toISOString().split('T')[0],
+          title: w.title + ' (копия)',
+          muscles: [...w.muscles],
+          duration: w.duration,
+          completed: true,
+          status: 'completed',
+          notes: w.notes
+        });
+        setEditingWorkout(null);
+        setIsModalOpen(true);
+      };
+
+      const openAddModal = (dateStr = null) => {
+        setEditingWorkout(null);
+        setFormData({
+          user: 'his',
+          date: dateStr || selectedDate || new Date().toISOString().split('T')[0],
+          title: '',
+          muscles: [],
+          duration: 60,
+          completed: true,
+          status: 'completed',
+          notes: ''
+        });
+        setIsModalOpen(true);
+      };
+
+      const openEditModal = (w) => {
+        setEditingWorkout(w);
+        setFormData({ ...w });
+        setIsModalOpen(true);
+      };
+
+      // Экспорт/Импорт JSON
+      const handleExport = () => {
+        const data = { workouts, muscleNotes, userNotes, exportDate: new Date().toISOString() };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `workout-backup-${new Date().toISOString().split('T')[0]}.json`;
+        a.click();
+      };
+
+      const handleImport = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = async (evt) => {
+          try {
+            const data = JSON.parse(evt.target.result);
+            await dbAPI.clearAndImport(data);
+            alert("Данные успешно импортированы!");
+            loadData();
+          } catch (err) {
+            alert("Ошибка при импорте файла: " + err.message);
+          }
+        };
+        reader.readAsText(file);
+      };
+
+      return (
+        <div className="max-w-md mx-auto min-h-screen bg-slate-900 text-slate-100 flex flex-col justify-between">
+          
+          {/* Header */}
+          <header className="sticky top-0 z-10 bg-slate-800/90 backdrop-blur border-b border-slate-700/50 p-4 flex justify-between items-center">
+            <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 to-pink-500 bg-clip-text text-transparent">
+              FitTogether
+            </h1>
+            <div className="flex gap-2">
+              <label className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg cursor-pointer text-xs flex items-center gap-1">
+                <Icon name="upload" className="w-4 h-4" />
+                <input type="file" accept=".json" onChange={handleImport} className="hidden" />
+              </label>
+              <button onClick={handleExport} className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-xs flex items-center gap-1">
+                <Icon name="download" className="w-4 h-4" />
+              </button>
+            </div>
+          </header>
+
+          {/* Main Content */}
+          <main className="flex-1 p-4 overflow-y-auto">
+            {activeTab === 'calendar' && (
+              <CalendarView 
+                workouts={workouts} 
+                currentMonth={currentMonth} 
+                setCurrentMonth={setCurrentMonth}
+                selectedDate={selectedDate}
+                setSelectedDate={setSelectedDate}
+                openAddModal={openAddModal}
+                openEditModal={openEditModal}
+                handleDeleteWorkout={handleDeleteWorkout}
+                handleDuplicateWorkout={handleDuplicateWorkout}
+              />
+            )}
+
+            {activeTab === 'muscles' && (
+              <MusclesView 
+                muscleNotes={muscleNotes} 
+                setMuscleNotes={setMuscleNotes}
+                workouts={workouts}
+              />
+            )}
+
+            {activeTab === 'stats' && (
+              <StatsView 
+                workouts={workouts}
+                currentMonth={currentMonth}
+                setCurrentMonth={setCurrentMonth}
+              />
+            )}
+
+            {activeTab === 'history' && (
+              <HistoryView 
+                workouts={workouts}
+                openEditModal={openEditModal}
+                handleDeleteWorkout={handleDeleteWorkout}
+                handleDuplicateWorkout={handleDuplicateWorkout}
+                userNotes={userNotes}
+                setUserNotes={setUserNotes}
+              />
+            )}
+          </main>
+
+          {/* Floating Action Button */}
+          <button 
+            onClick={() => openAddModal()}
+            className="fixed bottom-20 right-6 w-14 h-14 bg-gradient-to-r from-blue-500 to-pink-500 rounded-full flex items-center justify-center shadow-lg shadow-blue-500/30 active:scale-95 transition"
+          >
+            <Icon name="plus" className="w-8 h-8 text-white" />
+          </button>
+
+          {/* Bottom Navigation */}
+          <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-slate-800/95 backdrop-blur border-t border-slate-700/60 flex justify-around p-3 z-20">
+            {[
+              { id: 'calendar', label: 'Календарь', icon: 'calendar' },
+              { id: 'muscles', label: 'Мышцы', icon: 'dumbbell' },
+              { id: 'stats', label: 'Статистика', icon: 'bar-chart-2' },
+              { id: 'history', label: 'История', icon: 'clock' }
+            ].map(tab => (
+              <button 
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`flex flex-col items-center gap-1 text-xs transition ${activeTab === tab.id ? 'text-blue-400 font-semibold scale-105' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <Icon name={tab.icon} className="w-5 h-5" />
+                {tab.label}
+              </button>
+            ))}
+          </nav>
+
+          {/* Modal Add/Edit Workout */}
+          {isModalOpen && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
+              <div className="bg-slate-800 w-full max-w-md rounded-t-2xl sm:rounded-2xl border border-slate-700 p-5 space-y-4 max-h-[90vh] overflow-y-auto">
+                <div className="flex justify-between items-center border-b border-slate-700 pb-3">
+                  <h3 className="text-lg font-semibold">
+                    {editingWorkout ? 'Редактировать тренировку' : 'Новая тренировка'}
+                  </h3>
+                  <button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-white">
+                    <Icon name="x" className="w-6 h-6" />
+                  </button>
+                </div>
+
+                <form onSubmit={handleSaveWorkout} className="space-y-4">
+                  {/* Кто тренировался */}
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-2">Кто тренировался?</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setFormData({ ...formData, user: 'his' })}
+                        className={`p-3 rounded-xl border flex items-center justify-center gap-2 font-medium transition ${formData.user === 'his' ? 'bg-blue-600/20 border-blue-500 text-blue-400' : 'bg-slate-700/40 border-slate-600 text-slate-400'}`}
+                      >
+                        <span className="w-3 h-3 rounded-full bg-blue-500"></span> Я (Синий)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFormData({ ...formData, user: 'her' })}
+                        className={`p-3 rounded-xl border flex items-center justify-center gap-2 font-medium transition ${formData.user === 'her' ? 'bg-pink-600/20 border-pink-500 text-pink-400' : 'bg-slate-700/40 border-slate-600 text-slate-400'}`}
+                      >
+                        <span className="w-3 h-3 rounded-full bg-pink-500"></span> Девушка (Розовый)
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Дата и Название */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">Дата</label>
+                      <input 
+                        type="date"
+                        value={formData.date}
+                        onChange={(e) => setFormData({ ...formData, date: e.target.value })}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-400 mb-1">Длительность (мин)</label>
+                      <input 
+                        type="number"
+                        value={formData.duration}
+                        onChange={(e) => setFormData({ ...formData, duration: Number(e.target.value) })}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                        min="1"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Название тренировки</label>
+                    <input 
+                      type="text"
+                      placeholder="Например: Силовая на ноги"
+                      value={formData.title}
+                      onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                      required
+                    />
+                  </div>
+
+                  {/* Группы мышц */}
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-2">Группы мышц</label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {MUSCLE_GROUPS.map(m => {
+                        const isSelected = formData.muscles.includes(m.id);
+                        return (
+                          <button
+                            key={m.id}
+                            type="button"
+                            onClick={() => {
+                              const muscles = isSelected 
+                                ? formData.muscles.filter(id => id !== m.id)
+                                : [...formData.muscles, m.id];
+                              setFormData({ ...formData, muscles });
+                            }}
+                            className={`p-2 rounded-lg text-xs font-medium border transition text-center ${isSelected ? 'bg-indigo-600/30 border-indigo-500 text-indigo-300' : 'bg-slate-900 border-slate-700 text-slate-400'}`}
+                          >
+                            {m.name}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Статус */}
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Статус</label>
+                    <select
+                      value={formData.status}
+                      onChange={(e) => setFormData({ ...formData, status: e.target.value })}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                    >
+                      <option value="completed">Выполнена</option>
+                      <option value="planned">Запланирована</option>
+                      <option value="skipped">Пропущена</option>
+                    </select>
+                  </div>
+
+                  {/* Заметка */}
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Заметка / Комментарий</label>
+                    <textarea 
+                      rows="3"
+                      placeholder="Упражнения, веса, самочувствие..."
+                      value={formData.notes}
+                      onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-sm text-white focus:outline-none focus:border-blue-500"
+                    />
+                  </div>
+
+                  <button 
+                    type="submit"
+                    className="w-full py-3 bg-gradient-to-r from-blue-500 to-pink-500 text-white font-semibold rounded-xl shadow-md active:scale-98 transition"
+                  >
+                    Сохранить
+                  </button>
+                </form>
+              </div>
+            </div>
+          )}
+
+        </div>
+      );
+    }
+
+    // --- 1. КАЛЕНДАРЬ ---
+    function CalendarView({ workouts, currentMonth, setCurrentMonth, selectedDate, setSelectedDate, openAddModal, openEditModal, handleDeleteWorkout, handleDuplicateWorkout }) {
+      const year = currentMonth.getFullYear();
+      const month = currentMonth.getMonth();
+
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      const firstDayIndex = (new Date(year, month, 1).getDay() + 6) % 7; // Понедельник = 0
+
+      const monthNames = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+
+      const prevMonth = () => setCurrentMonth(new Date(year, month - 1, 1));
+      const nextMonth = () => setCurrentMonth(new Date(year, month + 1, 1));
+      const goToday = () => {
+        const today = new Date();
+        setCurrentMonth(today);
+        setSelectedDate(today.toISOString().split('T')[0]);
+      };
+
+      const selectedWorkouts = workouts.filter(w => w.date === selectedDate);
+
+      return (
+        <div className="space-y-4">
+          {/* Переключатель месяца */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700/60 shadow-sm">
+            <div className="flex justify-between items-center mb-4">
+              <button onClick={prevMonth} className="p-2 hover:bg-slate-700 rounded-lg text-slate-300">
+                ‹
+              </button>
+              <div className="text-center">
+                <h2 className="font-bold text-lg">{monthNames[month]} {year}</h2>
+                <button onClick={goToday} className="text-xs text-blue-400 hover:underline">Сегодня</button>
+              </div>
+              <button onClick={nextMonth} className="p-2 hover:bg-slate-700 rounded-lg text-slate-300">
+                ›
+              </button>
+            </div>
+
+            {/* Дни недели */}
+            <div className="grid grid-cols-7 gap-1 text-center text-xs font-semibold text-slate-400 mb-2">
+              <span>Пн</span><span>Вт</span><span>Ср</span><span>Чт</span><span>Пт</span><span>Сб</span><span>Вс</span>
+            </div>
+
+            {/* Сетка дней */}
+            <div className="grid grid-cols-7 gap-1">
+              {Array.from({ length: firstDayIndex }).map((_, i) => (
+                <div key={`empty-${i}`} className="h-10"></div>
+              ))}
+              {Array.from({ length: daysInMonth }).map((_, i) => {
+                const dayNum = i + 1;
+                const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+                const dayWorkouts = workouts.filter(w => w.date === dateStr);
+                const hasHis = dayWorkouts.some(w => w.user === 'his');
+                const hasHer = dayWorkouts.some(w => w.user === 'her');
+                const isSelected = selectedDate === dateStr;
+                const isToday = new Date().toISOString().split('T')[0] === dateStr;
+
+                return (
+                  <button
+                    key={dateStr}
+                    onClick={() => setSelectedDate(dateStr)}
+                    className={`h-10 rounded-xl flex flex-col items-center justify-center relative transition ${isSelected ? 'bg-blue-600/30 border border-blue-500' : 'hover:bg-slate-700/40'} ${isToday ? 'font-bold text-white ring-1 ring-slate-500' : 'text-slate-300'}`}
+                  >
+                    <span className="text-xs">{dayNum}</span>
+                    <div className="flex gap-1 mt-0.5">
+                      {hasHis && <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>}
+                      {hasHer && <span className="w-1.5 h-1.5 rounded-full bg-pink-500"></span>}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Детали выбранной даты */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700/60 space-y-3">
+            <div className="flex justify-between items-center border-b border-slate-700 pb-2">
+              <h3 className="font-semibold text-sm">
+                Тренировки: {new Date(selectedDate).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })}
+              </h3>
+              <button 
+                onClick={() => openAddModal(selectedDate)}
+                className="text-xs bg-blue-600 hover:bg-blue-500 px-3 py-1.5 rounded-lg text-white font-medium flex items-center gap-1"
+              >
+                + Добавить
+              </button>
+            </div>
+
+            {selectedWorkouts.length === 0 ? (
+              <p className="text-slate-400 text-xs py-4 text-center"> В этот день тренировок не было</p>
+            ) : (
+              <div className="space-y-3">
+                {selectedWorkouts.map(w => (
+                  <div 
+                    key={w.id} 
+                    className={`p-3 rounded-xl border relative ${w.user === 'his' ? 'bg-blue-950/20 border-blue-500/40' : 'bg-pink-950/20 border-pink-500/40'}`}
+                  >
+                    <div className="flex justify-between items-start">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-3 h-3 rounded-full ${w.user === 'his' ? 'bg-blue-500' : 'bg-pink-500'}`}></span>
+                        <h4 className="font-semibold text-sm">{w.title}</h4>
+                      </div>
+                      <div className="flex gap-1">
+                        <button onClick={() => handleDuplicateWorkout(w)} className="p-1 text-slate-400 hover:text-white" title="Повторить">
+                          📋
+                        </button>
+                        <button onClick={() => openEditModal(w)} className="p-1 text-slate-400 hover:text-white" title="Изменить">
+                          ✏️
+                        </button>
+                        <button onClick={() => handleDeleteWorkout(w.id)} className="p-1 text-slate-400 hover:text-red-400" title="Удалить">
+                          🗑️
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-2 text-xs text-slate-300 space-y-1">
+                      <p><strong>Время:</strong> {w.duration} мин | <strong>Статус:</strong> {w.status === 'completed' ? '✅ Выполнено' : w.status === 'planned' ? '📅 Запланировано' : '❌ Пропущено'}</p>
+                      {w.muscles.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {w.muscles.map(mId => {
+                            const mObj = MUSCLE_GROUPS.find(g => g.id === mId);
+                            return <span key={mId} className="px-2 py-0.5 bg-slate-700/60 rounded text-[10px] text-slate-200">{mObj ? mObj.name : mId}</span>;
+                          })}
+                        </div>
+                      )}
+                      {w.notes && <p className="mt-2 bg-slate-900/50 p-2 rounded text-slate-300 italic border-l-2 border-slate-600">{w.notes}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // --- 2. ГРУППЫ МЫШЦ ---
+    function MusclesView({ muscleNotes, setMuscleNotes, workouts }) {
+      const [selectedGroup, setSelectedGroup] = useState(MUSCLE_GROUPS[0].id);
+      const [selectedUser, setSelectedUser] = useState('his');
+      const [noteText, setNoteText] = useState('');
+
+      const groupObj = MUSCLE_GROUPS.find(g => g.id === selectedGroup);
+
+      useEffect(() => {
+        const note = muscleNotes.find(n => n.id === `${selectedGroup}_${selectedUser}`);
+        setNoteText(note ? note.text : '');
+      }, [selectedGroup, selectedUser, muscleNotes]);
+
+      const handleSaveNote = async () => {
+        const id = `${selectedGroup}_${selectedUser}`;
+        const item = { id, group: selectedGroup, user: selectedUser, text: noteText, updatedAt: new Date().toISOString() };
+        await dbAPI.save('muscleNotes', item);
+        const updated = await dbAPI.getAll('muscleNotes');
+        setMuscleNotes(updated);
+        alert("Заметка сохранена!");
+      };
+
+      // История тренировок группы
+      const groupHistory = workouts.filter(w => w.user === selectedUser && w.muscles.includes(selectedGroup));
+
+      return (
+        <div className="space-y-4">
+          {/* Выбор группы */}
+          <div className="grid grid-cols-3 gap-2">
+            {MUSCLE_GROUPS.map(g => (
+              <button
+                key={g.id}
+                onClick={() => setSelectedGroup(g.id)}
+                className={`p-3 rounded-xl border text-center font-medium text-xs transition ${selectedGroup === g.id ? 'bg-indigo-600/30 border-indigo-500 text-white shadow' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'}`}
+              >
+                {g.name}
+              </button>
+            ))}
+          </div>
+
+          {/* Переключатель Пользователя */}
+          <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700">
+            <button 
+              onClick={() => setSelectedUser('his')}
+              className={`flex-1 py-2 text-xs font-semibold rounded-lg transition ${selectedUser === 'his' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}
+            >
+              Я (Синий)
+            </button>
+            <button 
+              onClick={() => setSelectedUser('her')}
+              className={`flex-1 py-2 text-xs font-semibold rounded-lg transition ${selectedUser === 'her' ? 'bg-pink-600 text-white' : 'text-slate-400'}`}
+            >
+              Девушка (Розовый)
+            </button>
+          </div>
+
+          {/* Персональные заметки */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-3">
+            <h3 className="font-semibold text-sm">Заметки и Программа ({groupObj.name})</h3>
+            <textarea
+              rows="5"
+              value={noteText}
+              onChange={(e) => setNoteText(e.target.value)}
+              placeholder={`Напишите программу, особенности или советы по тренировке группы "${groupObj.name}"...`}
+              className="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-xs text-white focus:outline-none focus:border-indigo-500"
+            />
+            <button 
+              onClick={handleSaveNote}
+              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-semibold text-white transition"
+            >
+              Сохранить описание
+            </button>
+          </div>
+
+          {/* История группы */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-3">
+            <h3 className="font-semibold text-sm">История тренировок группы ({groupHistory.length})</h3>
+            {groupHistory.length === 0 ? (
+              <p className="text-xs text-slate-400 py-2">Нет записей тренировок этой группы мышц.</p>
+            ) : (
+              <div className="space-y-2">
+                {groupHistory.map(w => (
+                  <div key={w.id} className="p-3 bg-slate-900/60 rounded-xl border border-slate-700/50 text-xs">
+                    <div className="flex justify-between font-semibold">
+                      <span>{w.title}</span>
+                      <span className="text-slate-400">{w.date}</span>
+                    </div>
+                    {w.notes && <p className="text-slate-300 mt-1 italic">{w.notes}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // --- 3. СТАТИСТИКА ---
+    function StatsView({ workouts, currentMonth, setCurrentMonth }) {
+      const chartRef = useRef(null);
+      const chartInstance = useRef(null);
+
+      const year = currentMonth.getFullYear();
+      const month = currentMonth.getMonth();
+      const monthStr = `${year}-${String(month + 1).padStart(2, '0')}`;
+
+      const monthNames = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+
+      // Фильтр тренировок за выбранный месяц
+      const monthWorkouts = workouts.filter(w => w.date.startsWith(monthStr) && w.status === 'completed');
+
+      const hisCount = monthWorkouts.filter(w => w.user === 'his').length;
+      const herCount = monthWorkouts.filter(w => w.user === 'her').length;
+      const totalCount = monthWorkouts.length;
+
+      // Общий счетчик за все время
+      const totalHisAllTime = workouts.filter(w => w.user === 'his' && w.status === 'completed').length;
+      const totalHerAllTime = workouts.filter(w => w.user === 'her' && w.status === 'completed').length;
+
+      // Подсчет мышц за месяц
+      const muscleStats = MUSCLE_GROUPS.map(g => {
+        const countHis = monthWorkouts.filter(w => w.user === 'his' && w.muscles.includes(g.id)).length;
+        const countHer = monthWorkouts.filter(w => w.user === 'her' && w.muscles.includes(g.id)).length;
+        return { name: g.name, countHis, countHer };
+      });
+
+      useEffect(() => {
+        if (!chartRef.current) return;
+        const ctx = chartRef.current.getContext('2d');
+
+        if (chartInstance.current) {
+          chartInstance.current.destroy();
+        }
+
+        chartInstance.current = new Chart(ctx, {
+          type: 'bar',
+          data: {
+            labels: muscleStats.map(m => m.name),
+            datasets: [
+              {
+                label: 'Я (Синий)',
+                data: muscleStats.map(m => m.countHis),
+                backgroundColor: '#3b82f6'
+              },
+              {
+                label: 'Девушка (Розовый)',
+                data: muscleStats.map(m => m.countHer),
+                backgroundColor: '#ec4899'
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { labels: { color: '#94a3b8', font: { size: 10 } } }
+            },
+            scales: {
+              x: { ticks: { color: '#94a3b8' }, grid: { display: false } },
+              y: { ticks: { color: '#94a3b8', stepSize: 1 }, grid: { color: '#334155' } }
+            }
+          }
+        });
+      }, [muscleStats]);
+
+      return (
+        <div className="space-y-4">
+          {/* Месяц */}
+          <div className="flex justify-between items-center bg-slate-800 p-3 rounded-2xl border border-slate-700">
+            <button onClick={() => setCurrentMonth(new Date(year, month - 1, 1))} className="p-2 text-slate-400 hover:text-white">‹</button>
+            <h2 className="font-bold text-sm">{monthNames[month]} {year}</h2>
+            <button onClick={() => setCurrentMonth(new Date(year, month + 1, 1))} className="p-2 text-slate-400 hover:text-white">›</button>
+          </div>
+
+          {/* Карточки посещаемости за месяц */}
+          <div className="grid grid-cols-3 gap-2">
+            <div className="bg-slate-800 p-3 rounded-2xl border border-slate-700 text-center">
+              <span className="text-[10px] text-slate-400 uppercase font-semibold">Всего</span>
+              <p className="text-xl font-bold text-indigo-400 mt-1">{totalCount}</p>
+            </div>
+            <div className="bg-blue-950/30 p-3 rounded-2xl border border-blue-500/30 text-center">
+              <span className="text-[10px] text-blue-400 uppercase font-semibold">Я</span>
+              <p className="text-xl font-bold text-blue-400 mt-1">{hisCount}</p>
+            </div>
+            <div className="bg-pink-950/30 p-3 rounded-2xl border border-pink-500/30 text-center">
+              <span className="text-[10px] text-pink-400 uppercase font-semibold">Девушка</span>
+              <p className="text-xl font-bold text-pink-400 mt-1">{herCount}</p>
+            </div>
+          </div>
+
+          {/* За все время */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700 flex justify-between items-center text-xs">
+            <span className="text-slate-400">За всё время:</span>
+            <div className="flex gap-4">
+              <span className="text-blue-400 font-bold">Я: {totalHisAllTime}</span>
+              <span className="text-pink-400 font-bold">Девушка: {totalHerAllTime}</span>
+            </div>
+          </div>
+
+          {/* График групп мышц */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-2">
+            <h3 className="font-semibold text-xs text-slate-300 mb-2">Группы мышц за месяц</h3>
+            <canvas ref={chartRef}></canvas>
+          </div>
+        </div>
+      );
+    }
+
+    // --- 4. ИСТОРИЯ И ЛИЧНЫЕ ЗАМЕТКИ ---
+    function HistoryView({ workouts, openEditModal, handleDeleteWorkout, handleDuplicateWorkout, userNotes, setUserNotes }) {
+      const [filterUser, setFilterUser] = useState('all');
+      const [personalNoteHis, setPersonalNoteHis] = useState('');
+      const [personalNoteHer, setPersonalNoteHer] = useState('');
+
+      useEffect(() => {
+        const nHis = userNotes.find(n => n.id === 'note_his');
+        const nHer = userNotes.find(n => n.id === 'note_her');
+        setPersonalNoteHis(nHis ? nHis.text : '');
+        setPersonalNoteHer(nHer ? nHer.text : '');
+      }, [userNotes]);
+
+      const savePersonalNote = async (user, text) => {
+        const item = { id: `note_${user}`, user, text, updatedAt: new Date().toISOString() };
+        await dbAPI.save('userNotes', item);
+        const updated = await dbAPI.getAll('userNotes');
+        setUserNotes(updated);
+        alert("Личные заметки сохранены!");
+      };
+
+      const sortedWorkouts = [...workouts]
+        .filter(w => filterUser === 'all' || w.user === filterUser)
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+      return (
+        <div className="space-y-4">
+          {/* Фильтр */}
+          <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700 text-xs">
+            {['all', 'his', 'her'].map(u => (
+              <button 
+                key={u}
+                onClick={() => setFilterUser(u)}
+                className={`flex-1 py-1.5 rounded-lg capitalize font-medium transition ${filterUser === u ? 'bg-slate-700 text-white' : 'text-slate-400'}`}
+              >
+                {u === 'all' ? 'Все' : u === 'his' ? 'Я' : 'Девушка'}
+              </button>
+            ))}
+          </div>
+
+          {/* Список истории */}
+          <div className="space-y-3">
+            <h3 className="font-semibold text-xs text-slate-400">История тренировок</h3>
+            {sortedWorkouts.length === 0 ? (
+              <p className="text-xs text-slate-400 py-4 text-center">Записей пока нет.</p>
+            ) : (
+              sortedWorkouts.map(w => (
+                <div 
+                  key={w.id}
+                  className={`p-3.5 rounded-xl border ${w.user === 'his' ? 'bg-blue-950/20 border-blue-500/30' : 'bg-pink-950/20 border-pink-500/30'}`}
+                >
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <span className={`text-[10px] px-2 py-0.5 rounded font-bold uppercase ${w.user === 'his' ? 'bg-blue-500/20 text-blue-400' : 'bg-pink-500/20 text-pink-400'}`}>
+                        {w.user === 'his' ? 'Я' : 'Девушка'}
+                      </span>
+                      <h4 className="font-semibold text-sm mt-1">{w.title}</h4>
+                      <p className="text-xs text-slate-400">{w.date} • {w.duration} мин</p>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => handleDuplicateWorkout(w)} className="text-xs text-slate-400 hover:text-white">📋</button>
+                      <button onClick={() => openEditModal(w)} className="text-xs text-slate-400 hover:text-white">✏️</button>
+                      <button onClick={() => handleDeleteWorkout(w.id)} className="text-xs text-slate-400 hover:text-red-400">🗑️</button>
+                    </div>
+                  </div>
+                  {w.notes && <p className="text-xs text-slate-300 mt-2 p-2 bg-slate-900/50 rounded italic">{w.notes}</p>}
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Личный раздел заметок */}
+          <div className="bg-slate-800 p-4 rounded-2xl border border-slate-700 space-y-3">
+            <h3 className="font-semibold text-sm text-slate-200">Личные заметки</h3>
+            
+            <div className="space-y-2">
+              <label className="text-xs text-blue-400 font-semibold block">Заметки (Я)</label>
+              <textarea 
+                rows="3"
+                value={personalNoteHis}
+                onChange={(e) => setPersonalNoteHis(e.target.value)}
+                placeholder="Цели, замеренные объемы, спортивное питание..."
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-xs text-white"
+              />
+              <button 
+                onClick={() => savePersonalNote('his', personalNoteHis)}
+                className="px-3 py-1.5 bg-blue-600 rounded-lg text-xs font-medium text-white"
+              >
+                Сохранить мои заметки
+              </button>
+            </div>
+
+            <div className="space-y-2 pt-2 border-t border-slate-700">
+              <label className="text-xs text-pink-400 font-semibold block">Заметки (Девушка)</label>
+              <textarea 
+                rows="3"
+                value={personalNoteHer}
+                onChange={(e) => setPersonalNoteHer(e.target.value)}
+                placeholder="Цели, замеренные объемы, спортивное питание..."
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-xs text-white"
+              />
+              <button 
+                onClick={() => savePersonalNote('her', personalNoteHer)}
+                className="px-3 py-1.5 bg-pink-600 rounded-lg text-xs font-medium text-white"
+              >
+                Сохранить заметки девушки
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Рендер React
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+
+    // Регистрация Service Worker для PWA
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(err => console.log('SW reg error:', err));
+      });
+    }
+  </script>
+</body>
+</html>
